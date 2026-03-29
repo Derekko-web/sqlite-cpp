@@ -27,6 +27,9 @@ struct QueryInfo {
     bool is_count = false;
     std::vector<std::string> column_names;
     std::string table_name;
+    bool has_where_clause = false;
+    std::string where_column_name;
+    std::string where_value;
 };
 
 struct TableColumnDefinition {
@@ -78,6 +81,10 @@ std::string to_lower_ascii(std::string value) {
 
 std::string normalize_identifier(const std::string& value) {
     return to_lower_ascii(strip_identifier_quotes(trim(strip_trailing_semicolon(value))));
+}
+
+std::string normalize_literal_value(const std::string& value) {
+    return strip_identifier_quotes(trim(strip_trailing_semicolon(value)));
 }
 
 bool read_big_endian_u16(std::ifstream& file, std::streamoff offset, unsigned int& value) {
@@ -696,12 +703,39 @@ int find_column_index(
     return -1;
 }
 
+bool read_row_column_value(
+    const std::vector<unsigned char>& page,
+    const std::vector<RecordColumn>& columns,
+    std::uint64_t row_id,
+    int rowid_column_index,
+    int column_index,
+    std::string& value
+) {
+    if (column_index < 0) {
+        return false;
+    }
+
+    if (column_index == rowid_column_index) {
+        value = std::to_string(row_id);
+        return true;
+    }
+
+    if (static_cast<size_t>(column_index) >= columns.size()) {
+        return false;
+    }
+
+    return read_column_as_string(page, columns[static_cast<size_t>(column_index)], value);
+}
+
 bool read_table_rows(
     std::ifstream& database_file,
     unsigned int page_size,
     unsigned int page_number,
     int rowid_column_index,
     const std::vector<int>& column_indexes,
+    int where_column_index,
+    const std::string& where_value,
+    bool has_where_clause,
     std::vector<std::string>& rows
 ) {
     std::vector<unsigned char> page;
@@ -722,25 +756,37 @@ bool read_table_rows(
             return false;
         }
 
+        if (has_where_clause) {
+            std::string column_value;
+            if (!read_row_column_value(
+                    page,
+                    columns,
+                    row_id,
+                    rowid_column_index,
+                    where_column_index,
+                    column_value
+                )) {
+                return false;
+            }
+
+            if (column_value != where_value) {
+                continue;
+            }
+        }
+
         std::ostringstream row_output;
         for (size_t i = 0; i < column_indexes.size(); ++i) {
             int column_index = column_indexes[i];
-            if (column_index < 0) {
-                return false;
-            }
-
-            if (static_cast<size_t>(column_index) >= columns.size() &&
-                column_index != rowid_column_index) {
-                return false;
-            }
-
             std::string value;
-            if (column_index == rowid_column_index) {
-                value = std::to_string(row_id);
-            } else {
-                if (!read_column_as_string(page, columns[static_cast<size_t>(column_index)], value)) {
-                    return false;
-                }
+            if (!read_row_column_value(
+                    page,
+                    columns,
+                    row_id,
+                    rowid_column_index,
+                    column_index,
+                    value
+                )) {
+                return false;
             }
 
             if (i > 0) {
@@ -770,7 +816,15 @@ QueryInfo parse_query(const std::string& query) {
     }
 
     std::string select_list = trim(trimmed_query.substr(7, from_position - 7));
-    std::string table_name = trim(strip_trailing_semicolon(trimmed_query.substr(from_position + 6)));
+    size_t where_position = lower_query.find(" where ", from_position + 6);
+
+    std::string table_name;
+    if (where_position == std::string::npos) {
+        table_name = trim(strip_trailing_semicolon(trimmed_query.substr(from_position + 6)));
+    } else {
+        table_name = trim(trimmed_query.substr(from_position + 6, where_position - (from_position + 6)));
+    }
+
     if (select_list.empty() || table_name.empty()) {
         return parsed_query;
     }
@@ -792,6 +846,25 @@ QueryInfo parse_query(const std::string& query) {
         parsed_query.column_names.size() == 1 &&
         to_lower_ascii(parsed_query.column_names[0]) == "count(*)";
     parsed_query.table_name = table_name;
+
+    if (where_position != std::string::npos) {
+        std::string where_clause = trim(
+            strip_trailing_semicolon(trimmed_query.substr(where_position + 7))
+        );
+        size_t equals_position = where_clause.find('=');
+        if (where_clause.empty() || equals_position == std::string::npos) {
+            return QueryInfo{};
+        }
+
+        parsed_query.where_column_name = trim(where_clause.substr(0, equals_position));
+        parsed_query.where_value = normalize_literal_value(where_clause.substr(equals_position + 1));
+        if (parsed_query.where_column_name.empty()) {
+            return QueryInfo{};
+        }
+
+        parsed_query.has_where_clause = true;
+    }
+
     return parsed_query;
 }
 
@@ -864,7 +937,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (query.is_count) {
+    if (query.is_count && !query.has_where_clause) {
         unsigned int row_count;
         if (!read_btree_page_cell_count(
                 database_file,
@@ -895,14 +968,25 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<int> selected_column_indexes;
-    for (const std::string& column_name : query.column_names) {
-        int column_index = find_column_index(column_definitions, column_name);
-        if (column_index < 0) {
-            std::cerr << "Failed to find column in CREATE TABLE statement" << std::endl;
+    if (!query.is_count) {
+        for (const std::string& column_name : query.column_names) {
+            int column_index = find_column_index(column_definitions, column_name);
+            if (column_index < 0) {
+                std::cerr << "Failed to find column in CREATE TABLE statement" << std::endl;
+                return 1;
+            }
+
+            selected_column_indexes.push_back(column_index);
+        }
+    }
+
+    int where_column_index = -1;
+    if (query.has_where_clause) {
+        where_column_index = find_column_index(column_definitions, query.where_column_name);
+        if (where_column_index < 0) {
+            std::cerr << "Failed to find column in WHERE clause" << std::endl;
             return 1;
         }
-
-        selected_column_indexes.push_back(column_index);
     }
 
     std::vector<std::string> rows;
@@ -912,10 +996,18 @@ int main(int argc, char* argv[]) {
             static_cast<unsigned int>(table_schema.root_page),
             rowid_column_index,
             selected_column_indexes,
+            where_column_index,
+            query.where_value,
+            query.has_where_clause,
             rows
         )) {
         std::cerr << "Failed to read table rows" << std::endl;
         return 1;
+    }
+
+    if (query.is_count) {
+        std::cout << rows.size() << std::endl;
+        return 0;
     }
 
     for (const std::string& row : rows) {
