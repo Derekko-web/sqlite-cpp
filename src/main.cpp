@@ -37,6 +37,8 @@ struct TableColumnDefinition {
     bool is_integer_primary_key = false;
 };
 
+std::vector<std::string> split_top_level_comma_separated_values(const std::string& value);
+
 std::string trim(const std::string& value) {
     size_t start = 0;
     while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
@@ -395,6 +397,51 @@ bool read_table_leaf_cell_columns(
     return parse_record_columns(page, offset, static_cast<size_t>(payload_size), columns);
 }
 
+bool read_index_leaf_cell_columns(
+    const std::vector<unsigned char>& page,
+    size_t cell_offset,
+    std::vector<RecordColumn>& columns
+) {
+    std::uint64_t payload_size;
+    size_t bytes_read;
+    if (!read_varint(page, cell_offset, payload_size, bytes_read)) {
+        return false;
+    }
+
+    return parse_record_columns(
+        page,
+        cell_offset + bytes_read,
+        static_cast<size_t>(payload_size),
+        columns
+    );
+}
+
+bool read_index_interior_cell(
+    const std::vector<unsigned char>& page,
+    size_t cell_offset,
+    unsigned int& left_child_page_number,
+    std::vector<RecordColumn>& columns
+) {
+    if (cell_offset + 4 > page.size()) {
+        return false;
+    }
+
+    left_child_page_number = read_big_endian_u32(page, cell_offset);
+
+    std::uint64_t payload_size;
+    size_t bytes_read;
+    if (!read_varint(page, cell_offset + 4, payload_size, bytes_read)) {
+        return false;
+    }
+
+    return parse_record_columns(
+        page,
+        cell_offset + 4 + bytes_read,
+        static_cast<size_t>(payload_size),
+        columns
+    );
+}
+
 bool read_leaf_table_page_cell_offsets(
     const std::vector<unsigned char>& page,
     unsigned int page_number,
@@ -478,6 +525,54 @@ bool read_table_btree_page_header(
     return true;
 }
 
+bool read_index_btree_page_header(
+    const std::vector<unsigned char>& page,
+    unsigned int page_number,
+    unsigned char& page_type,
+    std::vector<unsigned int>& cell_offsets,
+    unsigned int& right_most_pointer
+) {
+    size_t header_offset = page_header_offset(page_number);
+    if (header_offset + 8 > page.size()) {
+        return false;
+    }
+
+    page_type = page[header_offset];
+    unsigned int cell_count = read_big_endian_u16(page, header_offset + 3);
+    size_t pointer_array_offset;
+
+    if (page_type == 0x0a) {
+        pointer_array_offset = header_offset + 8;
+        right_most_pointer = 0;
+    } else if (page_type == 0x02) {
+        if (header_offset + 12 > page.size()) {
+            return false;
+        }
+
+        pointer_array_offset = header_offset + 12;
+        right_most_pointer = read_big_endian_u32(page, header_offset + 8);
+    } else {
+        return false;
+    }
+
+    cell_offsets.clear();
+    for (unsigned int i = 0; i < cell_count; ++i) {
+        size_t pointer_offset = pointer_array_offset + (i * 2);
+        if (pointer_offset + 1 >= page.size()) {
+            return false;
+        }
+
+        unsigned int cell_offset = read_big_endian_u16(page, pointer_offset);
+        if (cell_offset >= page.size()) {
+            return false;
+        }
+
+        cell_offsets.push_back(cell_offset);
+    }
+
+    return true;
+}
+
 bool read_interior_table_cell_left_child(
     const std::vector<unsigned char>& page,
     size_t cell_offset,
@@ -489,6 +584,20 @@ bool read_interior_table_cell_left_child(
 
     left_child_page_number = read_big_endian_u32(page, cell_offset);
     return true;
+}
+
+bool read_interior_table_cell(
+    const std::vector<unsigned char>& page,
+    size_t cell_offset,
+    unsigned int& left_child_page_number,
+    std::uint64_t& key_row_id
+) {
+    if (!read_interior_table_cell_left_child(page, cell_offset, left_child_page_number)) {
+        return false;
+    }
+
+    size_t bytes_read;
+    return read_varint(page, cell_offset + 4, key_row_id, bytes_read);
 }
 
 bool extract_schema_entry_from_cell(
@@ -587,6 +696,70 @@ bool lookup_table_schema(
         if (entry.type == "table" &&
             normalize_identifier(entry.table_name) == normalized_table_name) {
             table_schema = entry;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool extract_index_columns_from_create_sql(
+    const std::string& create_sql,
+    std::vector<std::string>& index_columns
+) {
+    size_t open_parenthesis = create_sql.find('(');
+    size_t close_parenthesis = create_sql.rfind(')');
+    if (open_parenthesis == std::string::npos ||
+        close_parenthesis == std::string::npos ||
+        close_parenthesis <= open_parenthesis) {
+        return false;
+    }
+
+    std::vector<std::string> definitions = split_top_level_comma_separated_values(
+        create_sql.substr(open_parenthesis + 1, close_parenthesis - open_parenthesis - 1)
+    );
+
+    index_columns.clear();
+    for (const std::string& definition : definitions) {
+        std::string column_name = strip_identifier_quotes(trim(definition));
+        if (!column_name.empty()) {
+            index_columns.push_back(column_name);
+        }
+    }
+
+    return !index_columns.empty();
+}
+
+bool lookup_index_schema(
+    std::ifstream& database_file,
+    unsigned int page_size,
+    const std::string& table_name,
+    const std::string& column_name,
+    SchemaEntry& index_schema
+) {
+    std::vector<SchemaEntry> schema_entries;
+    if (!read_schema_entries(database_file, page_size, schema_entries)) {
+        return false;
+    }
+
+    std::string normalized_table_name = normalize_identifier(table_name);
+    std::string normalized_column_name = normalize_identifier(column_name);
+
+    for (const SchemaEntry& entry : schema_entries) {
+        if (entry.type != "index" ||
+            normalize_identifier(entry.table_name) != normalized_table_name ||
+            entry.sql.empty()) {
+            continue;
+        }
+
+        std::vector<std::string> index_columns;
+        if (!extract_index_columns_from_create_sql(entry.sql, index_columns) ||
+            index_columns.empty()) {
+            continue;
+        }
+
+        if (normalize_identifier(index_columns[0]) == normalized_column_name) {
+            index_schema = entry;
             return true;
         }
     }
@@ -772,6 +945,29 @@ int find_column_index(
     return -1;
 }
 
+bool read_index_key_value_and_rowid(
+    const std::vector<unsigned char>& page,
+    const std::vector<RecordColumn>& columns,
+    std::string& key_value,
+    std::uint64_t& row_id
+) {
+    if (columns.size() < 2) {
+        return false;
+    }
+
+    if (!read_text_column(page, columns[0], key_value)) {
+        return false;
+    }
+
+    std::int64_t integer_row_id;
+    if (!read_integer_column(page, columns.back(), integer_row_id)) {
+        return false;
+    }
+
+    row_id = static_cast<std::uint64_t>(integer_row_id);
+    return true;
+}
+
 bool read_row_column_value(
     const std::vector<unsigned char>& page,
     const std::vector<RecordColumn>& columns,
@@ -922,6 +1118,232 @@ bool read_table_rows(
         }
 
         rows.push_back(row_output.str());
+    }
+
+    return true;
+}
+
+bool collect_matching_row_ids_from_index(
+    std::ifstream& database_file,
+    unsigned int page_size,
+    unsigned int page_number,
+    const std::string& where_value,
+    std::vector<std::uint64_t>& matching_row_ids
+) {
+    std::vector<unsigned char> page;
+    if (!read_page(database_file, page_size, page_number, page)) {
+        return false;
+    }
+
+    unsigned char page_type;
+    std::vector<unsigned int> cell_offsets;
+    unsigned int right_most_pointer;
+    if (!read_index_btree_page_header(
+            page,
+            page_number,
+            page_type,
+            cell_offsets,
+            right_most_pointer
+        )) {
+        return false;
+    }
+
+    if (page_type == 0x0a) {
+        for (unsigned int cell_offset : cell_offsets) {
+            std::vector<RecordColumn> columns;
+            if (!read_index_leaf_cell_columns(page, cell_offset, columns)) {
+                return false;
+            }
+
+            std::string key_value;
+            std::uint64_t row_id;
+            if (!read_index_key_value_and_rowid(page, columns, key_value, row_id)) {
+                return false;
+            }
+
+            int comparison = key_value.compare(where_value);
+            if (comparison < 0) {
+                continue;
+            }
+
+            if (comparison == 0) {
+                matching_row_ids.push_back(row_id);
+                continue;
+            }
+
+            break;
+        }
+
+        return true;
+    }
+
+    if (page_type != 0x02) {
+        return false;
+    }
+
+    bool found_candidate = false;
+    bool matched_last_cell = false;
+
+    for (unsigned int cell_offset : cell_offsets) {
+        unsigned int left_child_page_number;
+        std::vector<RecordColumn> columns;
+        if (!read_index_interior_cell(page, cell_offset, left_child_page_number, columns)) {
+            return false;
+        }
+
+        std::string key_value;
+        std::uint64_t row_id;
+        if (!read_index_key_value_and_rowid(page, columns, key_value, row_id)) {
+            return false;
+        }
+
+        int comparison = key_value.compare(where_value);
+        if (!found_candidate) {
+            if (comparison < 0) {
+                continue;
+            }
+            found_candidate = true;
+        }
+
+        if (!collect_matching_row_ids_from_index(
+                database_file,
+                page_size,
+                left_child_page_number,
+                where_value,
+                matching_row_ids
+            )) {
+            return false;
+        }
+
+        if (comparison == 0) {
+            matching_row_ids.push_back(row_id);
+            matched_last_cell = true;
+            continue;
+        }
+
+        return true;
+    }
+
+    if (!found_candidate || matched_last_cell) {
+        if (!collect_matching_row_ids_from_index(
+                database_file,
+                page_size,
+                right_most_pointer,
+                where_value,
+                matching_row_ids
+            )) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool read_table_row_by_row_id(
+    std::ifstream& database_file,
+    unsigned int page_size,
+    unsigned int page_number,
+    std::uint64_t target_row_id,
+    int rowid_column_index,
+    const std::vector<int>& column_indexes,
+    bool& found,
+    std::string& row
+) {
+    std::vector<unsigned char> page;
+    if (!read_page(database_file, page_size, page_number, page)) {
+        return false;
+    }
+
+    unsigned char page_type;
+    std::vector<unsigned int> cell_offsets;
+    unsigned int right_most_pointer;
+    if (!read_table_btree_page_header(
+            page,
+            page_number,
+            page_type,
+            cell_offsets,
+            right_most_pointer
+        )) {
+        return false;
+    }
+
+    if (page_type == 0x05) {
+        for (unsigned int cell_offset : cell_offsets) {
+            unsigned int left_child_page_number;
+            std::uint64_t key_row_id;
+            if (!read_interior_table_cell(page, cell_offset, left_child_page_number, key_row_id)) {
+                return false;
+            }
+
+            if (target_row_id <= key_row_id) {
+                return read_table_row_by_row_id(
+                    database_file,
+                    page_size,
+                    left_child_page_number,
+                    target_row_id,
+                    rowid_column_index,
+                    column_indexes,
+                    found,
+                    row
+                );
+            }
+        }
+
+        return read_table_row_by_row_id(
+            database_file,
+            page_size,
+            right_most_pointer,
+            target_row_id,
+            rowid_column_index,
+            column_indexes,
+            found,
+            row
+        );
+    }
+
+    if (page_type != 0x0d) {
+        return false;
+    }
+
+    found = false;
+    for (unsigned int cell_offset : cell_offsets) {
+        std::vector<RecordColumn> columns;
+        std::uint64_t row_id;
+        if (!read_table_leaf_cell_columns(page, cell_offset, row_id, columns)) {
+            return false;
+        }
+
+        if (row_id < target_row_id) {
+            continue;
+        }
+
+        if (row_id > target_row_id) {
+            return true;
+        }
+
+        std::ostringstream row_output;
+        for (size_t i = 0; i < column_indexes.size(); ++i) {
+            std::string value;
+            if (!read_row_column_value(
+                    page,
+                    columns,
+                    row_id,
+                    rowid_column_index,
+                    column_indexes[i],
+                    value
+                )) {
+                return false;
+            }
+
+            if (i > 0) {
+                row_output << "|";
+            }
+            row_output << value;
+        }
+
+        row = row_output.str();
+        found = true;
+        return true;
     }
 
     return true;
@@ -1097,6 +1519,60 @@ int main(int argc, char* argv[]) {
             std::cerr << "Failed to find column in WHERE clause" << std::endl;
             return 1;
         }
+    }
+
+    SchemaEntry index_schema;
+    bool has_usable_index =
+        query.has_where_clause &&
+        lookup_index_schema(
+            database_file,
+            page_size,
+            query.table_name,
+            query.where_column_name,
+            index_schema
+        );
+
+    if (has_usable_index) {
+        std::vector<std::uint64_t> matching_row_ids;
+        if (!collect_matching_row_ids_from_index(
+                database_file,
+                page_size,
+                static_cast<unsigned int>(index_schema.root_page),
+                query.where_value,
+                matching_row_ids
+            )) {
+            std::cerr << "Failed to read index b-tree" << std::endl;
+            return 1;
+        }
+
+        if (query.is_count) {
+            std::cout << matching_row_ids.size() << std::endl;
+            return 0;
+        }
+
+        for (std::uint64_t row_id : matching_row_ids) {
+            bool found = false;
+            std::string row;
+            if (!read_table_row_by_row_id(
+                    database_file,
+                    page_size,
+                    static_cast<unsigned int>(table_schema.root_page),
+                    row_id,
+                    rowid_column_index,
+                    selected_column_indexes,
+                    found,
+                    row
+                )) {
+                std::cerr << "Failed to read table row by rowid" << std::endl;
+                return 1;
+            }
+
+            if (found) {
+                std::cout << row << std::endl;
+            }
+        }
+
+        return 0;
     }
 
     std::vector<std::string> rows;
