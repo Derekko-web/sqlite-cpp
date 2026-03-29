@@ -25,7 +25,7 @@ struct RecordColumn {
 struct QueryInfo {
     bool valid = false;
     bool is_count = false;
-    std::string column_name;
+    std::vector<std::string> column_names;
     std::string table_name;
 };
 
@@ -696,13 +696,13 @@ int find_column_index(
     return -1;
 }
 
-bool read_table_column_values(
+bool read_table_rows(
     std::ifstream& database_file,
     unsigned int page_size,
     unsigned int page_number,
     int rowid_column_index,
-    size_t column_index,
-    std::vector<std::string>& values
+    const std::vector<int>& column_indexes,
+    std::vector<std::string>& rows
 ) {
     std::vector<unsigned char> page;
     if (!read_page(database_file, page_size, page_number, page)) {
@@ -714,7 +714,7 @@ bool read_table_column_values(
         return false;
     }
 
-    values.clear();
+    rows.clear();
     for (unsigned int cell_offset : cell_offsets) {
         std::vector<RecordColumn> columns;
         std::uint64_t row_id;
@@ -722,45 +722,76 @@ bool read_table_column_values(
             return false;
         }
 
-        if (column_index >= columns.size() && static_cast<int>(column_index) != rowid_column_index) {
-            return false;
-        }
-
-        std::string value;
-        if (static_cast<int>(column_index) == rowid_column_index) {
-            value = std::to_string(row_id);
-        } else {
-            if (!read_column_as_string(page, columns[column_index], value)) {
+        std::ostringstream row_output;
+        for (size_t i = 0; i < column_indexes.size(); ++i) {
+            int column_index = column_indexes[i];
+            if (column_index < 0) {
                 return false;
             }
+
+            if (static_cast<size_t>(column_index) >= columns.size() &&
+                column_index != rowid_column_index) {
+                return false;
+            }
+
+            std::string value;
+            if (column_index == rowid_column_index) {
+                value = std::to_string(row_id);
+            } else {
+                if (!read_column_as_string(page, columns[static_cast<size_t>(column_index)], value)) {
+                    return false;
+                }
+            }
+
+            if (i > 0) {
+                row_output << "|";
+            }
+            row_output << value;
         }
 
-        values.push_back(value);
+        rows.push_back(row_output.str());
     }
 
     return true;
 }
 
 QueryInfo parse_query(const std::string& query) {
-    std::istringstream query_stream(query);
-    std::vector<std::string> tokens;
-    std::string token;
-
-    while (query_stream >> token) {
-        tokens.push_back(token);
-    }
-
     QueryInfo parsed_query;
-    if (tokens.size() != 4 ||
-        to_lower_ascii(tokens[0]) != "select" ||
-        to_lower_ascii(tokens[2]) != "from") {
+    std::string trimmed_query = trim(query);
+    std::string lower_query = to_lower_ascii(trimmed_query);
+
+    if (lower_query.rfind("select ", 0) != 0) {
         return parsed_query;
     }
 
+    size_t from_position = lower_query.find(" from ", 7);
+    if (from_position == std::string::npos) {
+        return parsed_query;
+    }
+
+    std::string select_list = trim(trimmed_query.substr(7, from_position - 7));
+    std::string table_name = trim(strip_trailing_semicolon(trimmed_query.substr(from_position + 6)));
+    if (select_list.empty() || table_name.empty()) {
+        return parsed_query;
+    }
+
+    parsed_query.column_names = split_top_level_comma_separated_values(select_list);
+    if (parsed_query.column_names.empty()) {
+        return parsed_query;
+    }
+
+    for (std::string& column_name : parsed_query.column_names) {
+        column_name = trim(strip_trailing_semicolon(column_name));
+        if (column_name.empty()) {
+            return QueryInfo{};
+        }
+    }
+
     parsed_query.valid = true;
-    parsed_query.is_count = to_lower_ascii(tokens[1]) == "count(*)";
-    parsed_query.column_name = strip_trailing_semicolon(tokens[1]);
-    parsed_query.table_name = strip_trailing_semicolon(tokens[3]);
+    parsed_query.is_count =
+        parsed_query.column_names.size() == 1 &&
+        to_lower_ascii(parsed_query.column_names[0]) == "count(*)";
+    parsed_query.table_name = table_name;
     return parsed_query;
 }
 
@@ -855,12 +886,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int column_index = find_column_index(column_definitions, query.column_name);
-    if (column_index < 0) {
-        std::cerr << "Failed to find column in CREATE TABLE statement" << std::endl;
-        return 1;
-    }
-
     int rowid_column_index = -1;
     for (size_t i = 0; i < column_definitions.size(); ++i) {
         if (column_definitions[i].is_integer_primary_key) {
@@ -869,21 +894,32 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::vector<std::string> values;
-    if (!read_table_column_values(
+    std::vector<int> selected_column_indexes;
+    for (const std::string& column_name : query.column_names) {
+        int column_index = find_column_index(column_definitions, column_name);
+        if (column_index < 0) {
+            std::cerr << "Failed to find column in CREATE TABLE statement" << std::endl;
+            return 1;
+        }
+
+        selected_column_indexes.push_back(column_index);
+    }
+
+    std::vector<std::string> rows;
+    if (!read_table_rows(
             database_file,
             page_size,
             static_cast<unsigned int>(table_schema.root_page),
             rowid_column_index,
-            static_cast<size_t>(column_index),
-            values
+            selected_column_indexes,
+            rows
         )) {
         std::cerr << "Failed to read table rows" << std::endl;
         return 1;
     }
 
-    for (const std::string& value : values) {
-        std::cout << value << std::endl;
+    for (const std::string& row : rows) {
+        std::cout << row << std::endl;
     }
 
     return 0;
