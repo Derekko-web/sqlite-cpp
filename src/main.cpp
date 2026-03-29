@@ -110,6 +110,14 @@ unsigned int read_big_endian_u16(const std::vector<unsigned char>& data, size_t 
         static_cast<unsigned int>(data[offset + 1]);
 }
 
+unsigned int read_big_endian_u32(const std::vector<unsigned char>& data, size_t offset) {
+    return
+        (static_cast<unsigned int>(data[offset]) << 24) |
+        (static_cast<unsigned int>(data[offset + 1]) << 16) |
+        (static_cast<unsigned int>(data[offset + 2]) << 8) |
+        static_cast<unsigned int>(data[offset + 3]);
+}
+
 bool read_page(
     std::ifstream& file,
     unsigned int page_size,
@@ -419,6 +427,67 @@ bool read_leaf_table_page_cell_offsets(
         cell_offsets.push_back(cell_offset);
     }
 
+    return true;
+}
+
+bool read_table_btree_page_header(
+    const std::vector<unsigned char>& page,
+    unsigned int page_number,
+    unsigned char& page_type,
+    std::vector<unsigned int>& cell_offsets,
+    unsigned int& right_most_pointer
+) {
+    size_t header_offset = page_header_offset(page_number);
+    if (header_offset + 8 > page.size()) {
+        return false;
+    }
+
+    page_type = page[header_offset];
+    unsigned int cell_count = read_big_endian_u16(page, header_offset + 3);
+    size_t pointer_array_offset;
+
+    if (page_type == 0x0d) {
+        pointer_array_offset = header_offset + 8;
+        right_most_pointer = 0;
+    } else if (page_type == 0x05) {
+        if (header_offset + 12 > page.size()) {
+            return false;
+        }
+
+        pointer_array_offset = header_offset + 12;
+        right_most_pointer = read_big_endian_u32(page, header_offset + 8);
+    } else {
+        return false;
+    }
+
+    cell_offsets.clear();
+    for (unsigned int i = 0; i < cell_count; ++i) {
+        size_t pointer_offset = pointer_array_offset + (i * 2);
+        if (pointer_offset + 1 >= page.size()) {
+            return false;
+        }
+
+        unsigned int cell_offset = read_big_endian_u16(page, pointer_offset);
+        if (cell_offset >= page.size()) {
+            return false;
+        }
+
+        cell_offsets.push_back(cell_offset);
+    }
+
+    return true;
+}
+
+bool read_interior_table_cell_left_child(
+    const std::vector<unsigned char>& page,
+    size_t cell_offset,
+    unsigned int& left_child_page_number
+) {
+    if (cell_offset + 4 > page.size()) {
+        return false;
+    }
+
+    left_child_page_number = read_big_endian_u32(page, cell_offset);
     return true;
 }
 
@@ -743,8 +812,65 @@ bool read_table_rows(
         return false;
     }
 
+    unsigned char page_type;
     std::vector<unsigned int> cell_offsets;
-    if (!read_leaf_table_page_cell_offsets(page, page_number, cell_offsets)) {
+    unsigned int right_most_pointer;
+    if (!read_table_btree_page_header(
+            page,
+            page_number,
+            page_type,
+            cell_offsets,
+            right_most_pointer
+        )) {
+        return false;
+    }
+
+    if (page_type == 0x05) {
+        rows.clear();
+        for (unsigned int cell_offset : cell_offsets) {
+            unsigned int left_child_page_number;
+            if (!read_interior_table_cell_left_child(page, cell_offset, left_child_page_number)) {
+                return false;
+            }
+
+            std::vector<std::string> child_rows;
+            if (!read_table_rows(
+                    database_file,
+                    page_size,
+                    left_child_page_number,
+                    rowid_column_index,
+                    column_indexes,
+                    where_column_index,
+                    where_value,
+                    has_where_clause,
+                    child_rows
+                )) {
+                return false;
+            }
+
+            rows.insert(rows.end(), child_rows.begin(), child_rows.end());
+        }
+
+        std::vector<std::string> right_most_rows;
+        if (!read_table_rows(
+                database_file,
+                page_size,
+                right_most_pointer,
+                rowid_column_index,
+                column_indexes,
+                where_column_index,
+                where_value,
+                has_where_clause,
+                right_most_rows
+            )) {
+            return false;
+        }
+
+        rows.insert(rows.end(), right_most_rows.begin(), right_most_rows.end());
+        return true;
+    }
+
+    if (page_type != 0x0d) {
         return false;
     }
 
@@ -935,22 +1061,6 @@ int main(int argc, char* argv[]) {
     if (!lookup_table_schema(database_file, page_size, query.table_name, table_schema)) {
         std::cerr << "Failed to find table in sqlite_schema" << std::endl;
         return 1;
-    }
-
-    if (query.is_count && !query.has_where_clause) {
-        unsigned int row_count;
-        if (!read_btree_page_cell_count(
-                database_file,
-                page_size,
-                static_cast<unsigned int>(table_schema.root_page),
-                row_count
-            )) {
-            std::cerr << "Failed to read table b-tree page" << std::endl;
-            return 1;
-        }
-
-        std::cout << row_count << std::endl;
-        return 0;
     }
 
     std::vector<TableColumnDefinition> column_definitions;
