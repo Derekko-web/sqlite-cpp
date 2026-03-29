@@ -948,6 +948,7 @@ int find_column_index(
 bool read_index_key_value_and_rowid(
     const std::vector<unsigned char>& page,
     const std::vector<RecordColumn>& columns,
+    bool& key_is_null,
     std::string& key_value,
     std::uint64_t& row_id
 ) {
@@ -955,7 +956,10 @@ bool read_index_key_value_and_rowid(
         return false;
     }
 
-    if (!read_text_column(page, columns[0], key_value)) {
+    key_is_null = columns[0].serial_type == 0;
+    if (key_is_null) {
+        key_value.clear();
+    } else if (!read_text_column(page, columns[0], key_value)) {
         return false;
     }
 
@@ -966,6 +970,14 @@ bool read_index_key_value_and_rowid(
 
     row_id = static_cast<std::uint64_t>(integer_row_id);
     return true;
+}
+
+int compare_index_key_to_target(bool key_is_null, const std::string& key_value, const std::string& target_value) {
+    if (key_is_null) {
+        return -1;
+    }
+
+    return key_value.compare(target_value);
 }
 
 bool read_row_column_value(
@@ -1155,13 +1167,14 @@ bool collect_matching_row_ids_from_index(
                 return false;
             }
 
+            bool key_is_null;
             std::string key_value;
             std::uint64_t row_id;
-            if (!read_index_key_value_and_rowid(page, columns, key_value, row_id)) {
+            if (!read_index_key_value_and_rowid(page, columns, key_is_null, key_value, row_id)) {
                 return false;
             }
 
-            int comparison = key_value.compare(where_value);
+            int comparison = compare_index_key_to_target(key_is_null, key_value, where_value);
             if (comparison < 0) {
                 continue;
             }
@@ -1191,13 +1204,14 @@ bool collect_matching_row_ids_from_index(
             return false;
         }
 
+        bool key_is_null;
         std::string key_value;
         std::uint64_t row_id;
-        if (!read_index_key_value_and_rowid(page, columns, key_value, row_id)) {
+        if (!read_index_key_value_and_rowid(page, columns, key_is_null, key_value, row_id)) {
             return false;
         }
 
-        int comparison = key_value.compare(where_value);
+        int comparison = compare_index_key_to_target(key_is_null, key_value, where_value);
         if (!found_candidate) {
             if (comparison < 0) {
                 continue;
