@@ -1,76 +1,42 @@
-[![progress-banner](https://backend.codecrafters.io/progress/sqlite/cbd3c81d-4d3b-4820-ba61-8789f59272a8)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# SQLite database reader in C++
 
-This is a starting point for C++ solutions to the
-["Build Your Own SQLite" Challenge](https://codecrafters.io/challenges/sqlite).
+Maintained by **Derek Ko**.
 
-In this challenge, you'll build a barebones SQLite implementation that supports
-basic SQL queries like `SELECT`. Along the way we'll learn about
-[SQLite's file format](https://www.sqlite.org/fileformat.html), how indexed data
-is
-[stored in B-trees](https://jvns.ca/blog/2014/10/02/how-does-sqlite-work-part-2-btrees/)
-and more.
+A reader for SQLite database files that implements binary record decoding,
+B-tree traversal, and a limited SQL query path in C++.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Features
 
-# Passing the first stage
+- Database information and table-name listing
+- SQLite schema and record decoding
+- Table and index B-tree traversal
+- Selected-column queries and `COUNT(*)`
+- Equality filters with index-based row lookup where supported
 
-The entry point for your SQLite implementation is in `src/main.cpp`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+## Build and run
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
-
-Time to move on to the next stage!
-
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cmake` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.cpp`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
-
-# Sample Databases
-
-To make it easy to test queries locally, we've added a sample database in the
-root of this repository: `sample.db`.
-
-This contains two tables: `apples` & `oranges`. You can use this to test your
-implementation for the first 6 stages.
-
-You can explore this database by running queries against it like this:
+Requires CMake 3.13+ and a C++ compiler with C++23 support. No SQLite library
+is required by the reader itself.
 
 ```sh
-$ sqlite3 sample.db "select id, name from apples"
-1|Granny Smith
-2|Fuji
-3|Honeycrisp
-4|Golden Delicious
+./your_program.sh sample.db .dbinfo
+./your_program.sh sample.db .tables
 ```
 
-There are two other databases that you can use:
-
-1. `superheroes.db`:
-   - This is a small version of the test database used in the table-scan stage.
-   - It contains one table: `superheroes`.
-   - It is ~1MB in size.
-1. `companies.db`:
-   - This is a small version of the test database used in the index-scan stage.
-   - It contains one table: `companies`, and one index: `idx_companies_country`
-   - It is ~7MB in size.
-
-These aren't included in the repository because they're large in size. You can
-download them by running this script:
+Generate an independent demonstration database with Python's standard library:
 
 ```sh
-./download_sample_databases.sh
+python3 create_sample_database.py
+./your_program.sh demo.db "SELECT name FROM projects WHERE category = 'systems'"
 ```
 
-If the script doesn't work for some reason, you can download the databases
-directly from
-[codecrafters-io/sample-sqlite-databases](https://github.com/codecrafters-io/sample-sqlite-databases).
+For a direct build:
+
+```sh
+cmake -S . -B build
+cmake --build build
+./build/sqlite sample.db .tables
+```
+
+Source code is in `src/main.cpp`. This is a read-only implementation with a
+limited SQL subset; it does not implement general SQL execution or writes.
